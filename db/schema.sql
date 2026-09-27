@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS requests (
 );
 
 CREATE TABLE IF NOT EXISTS prompts (
+    
     name        TEXT NOT NULL,
     version     TEXT NOT NULL,
     body        TEXT NOT NULL,
@@ -21,6 +22,9 @@ CREATE TABLE IF NOT EXISTS prompts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (name, version)
 );
+    INSERT INTO prompts (name, version, body, active) VALUES
+    ('supportprompt', 'v1', 'You are an assistant.', false),
+    ('supportprompt', 'v2', 'You are a support assistant. Be concise and helpful.', true);
 
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests (model);
