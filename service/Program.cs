@@ -28,7 +28,19 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var model = defaultModel;  // TODO(student, W2)
 
     // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
-    var systemPrompt = "You are a support assistant.";  // TODO(student, W1)
+    string systemPrompt;
+
+    string promptVersion;
+
+    try
+{
+    (systemPrompt, promptVersion) = await GetActivePrompt(dbConn);
+}
+catch
+{
+    Console.Error.WriteLine($"[{requestId}] DB unavailable, cannot load prompt");
+    return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
+}
 
     // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
     // TODO(student, W3)
@@ -87,10 +99,28 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     decimal? costUsd = null;  // TODO(student, W2)
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
+
+static async Task<(string body, string version)> GetActivePrompt(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT body, version FROM prompts WHERE active = true LIMIT 1", db);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+    {
+        var body = reader.GetString(0);
+        var version = reader.GetString(1);
+        return (body, version);
+    }
+
+    return ("You are an assistant.", "none");
+}
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
@@ -103,7 +133,7 @@ app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals
 app.Run("http://0.0.0.0:8080");
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, int latency,
+static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
 {
     try
@@ -111,12 +141,13 @@ static async Task LogRequest(string conn, Guid id, string model, int latency,
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, prompt_version, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @lat, @pt, @pv, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);
+        cmd.Parameters.AddWithValue("pv", promptVersion);
         cmd.Parameters.AddWithValue("ct", completionTokens);
         cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
         cmd.Parameters.AddWithValue("status", status.ToString());
