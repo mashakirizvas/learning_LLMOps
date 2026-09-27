@@ -126,7 +126,40 @@ static async Task<(string body, string version)> GetActivePrompt(string conn)
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
 app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
-app.MapGet("/prompts", () => Results.Json(new { todo = "list from prompts table" }));              // W1/W2: [ { name, version, active } ]
+app.MapGet("/prompts", async () =>
+{
+    var result = new List<object>();
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT name, version, active FROM prompts WHERE name = 'support-system' ORDER BY version", db);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        result.Add(new {
+            name = reader.GetString(0),
+            version = reader.GetString(1),
+            active = reader.GetBoolean(2)
+        });
+    }
+    return Results.Json(result);
+});
+app.MapPost("/prompts/{version}/activate", async (string version) =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "UPDATE prompts SET active = (version = @v) "
+        + "WHERE name = 'support-system' "
+        + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db);
+    cmd.Parameters.AddWithValue("v", version);
+    var rowsAffected = await cmd.ExecuteNonQueryAsync();
+
+    if (rowsAffected == 0)
+        return Results.NotFound(new { error = $"version {version} not found" });
+
+    return Results.Ok(new { activated = version });
+});
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
