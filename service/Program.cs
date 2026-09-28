@@ -148,45 +148,29 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
 {
     await using var db = new NpgsqlConnection(dbConn);
     await db.OpenAsync();
+    await using var tx = await db.BeginTransactionAsync();
+
     await using var cmd = new NpgsqlCommand(
         "UPDATE prompts SET active = (version = @v) "
         + "WHERE name = 'support-system' "
-        + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db);
+        + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db, tx);
     cmd.Parameters.AddWithValue("v", version);
     var rowsAffected = await cmd.ExecuteNonQueryAsync();
 
     if (rowsAffected == 0)
+    {
+        await tx.RollbackAsync();
         return Results.NotFound(new { error = $"version {version} not found" });
+    }
 
+    await using var logCmd = new NpgsqlCommand(
+        "INSERT INTO prompt_activations (name, version) "
+        + "VALUES ('support-system', @v)", db, tx);
+    logCmd.Parameters.AddWithValue("v", version);
+    await logCmd.ExecuteNonQueryAsync();
+
+    await tx.CommitAsync();
     return Results.Ok(new { activated = version });
 });
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
-
-app.Run("http://0.0.0.0:8080");
-
-// пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
-{
-    try
-    {
-        await using var db = new NpgsqlConnection(conn);
-        await db.OpenAsync();
-        await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, prompt_version, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @lat, @pt, @pv, @ct, @cost, @status)", db);
-        cmd.Parameters.AddWithValue("id", id);
-        cmd.Parameters.AddWithValue("model", model);
-        cmd.Parameters.AddWithValue("lat", latency);
-        cmd.Parameters.AddWithValue("pt", promptTokens);
-        cmd.Parameters.AddWithValue("pv", promptVersion);
-        cmd.Parameters.AddWithValue("ct", completionTokens);
-        cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("status", status.ToString());
-        await cmd.ExecuteNonQueryAsync();
-    }
-    catch { /* не валимо запит через лог */ }
-}
 
 record ChatIn(string Message);
