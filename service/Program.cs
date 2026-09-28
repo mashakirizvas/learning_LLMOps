@@ -173,4 +173,27 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
     return Results.Ok(new { activated = version });
 });
 
+static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
+    int promptTokens, int completionTokens, decimal? cost, int status)
+{
+    try
+    {
+        await using var db = new NpgsqlConnection(conn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @pv, @lat, @pt, @ct, @cost, @status)", db);
+        cmd.Parameters.AddWithValue("id", id);
+        cmd.Parameters.AddWithValue("model", model);
+        cmd.Parameters.AddWithValue("pv", promptVersion);
+        cmd.Parameters.AddWithValue("lat", latency);
+        cmd.Parameters.AddWithValue("pt", promptTokens);
+        cmd.Parameters.AddWithValue("ct", completionTokens);
+        cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("status", status.ToString());
+        await cmd.ExecuteNonQueryAsync();
+    }
+    catch { /* не валимо запит через лог */ }
+}
+
 record ChatIn(string Message);
