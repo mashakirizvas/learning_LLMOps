@@ -126,7 +126,11 @@ app.MapGet("/prompts", async () =>
     }
     return Results.Json(result);
 });
-app.MapPost("/prompts/{version}/activate", async (string version) =>
+
+app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
+app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+
+app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest request) =>
 {
     await using var db = new NpgsqlConnection(dbConn);
     await db.OpenAsync();
@@ -145,10 +149,12 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
         return Results.NotFound(new { error = $"version {version} not found" });
     }
 
+        var actor = request.Headers["X-Actor"].FirstOrDefault() ?? "unknown";
     await using var logCmd = new NpgsqlCommand(
-        "INSERT INTO prompt_activations (name, version) "
-        + "VALUES ('support-system', @v)", db, tx);
+        "INSERT INTO prompt_activations (name, version, actor) "
+        + "VALUES ('support-system', @v, @actor)", db, tx);
     logCmd.Parameters.AddWithValue("v", version);
+    logCmd.Parameters.AddWithValue("actor", actor);
     await logCmd.ExecuteNonQueryAsync();
 
     await tx.CommitAsync();
