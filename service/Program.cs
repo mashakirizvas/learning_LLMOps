@@ -104,24 +104,6 @@ catch
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
 
-static async Task<(string body, string version)> GetActivePrompt(string conn)
-{
-    await using var db = new NpgsqlConnection(conn);
-    await db.OpenAsync();
-    await using var cmd = new NpgsqlCommand(
-        "SELECT body, version FROM prompts WHERE active = true LIMIT 1", db);
-
-    await using var reader = await cmd.ExecuteReaderAsync();
-    if (await reader.ReadAsync())
-    {
-        var body = reader.GetString(0);
-        var version = reader.GetString(1);
-        return (body, version);
-    }
-
-    return ("You are an assistant.", "none");
-}
-
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
@@ -172,6 +154,26 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
     await tx.CommitAsync();
     return Results.Ok(new { activated = version });
 });
+
+app.Run("http://0.0.0.0:8080");
+
+static async Task<(string body, string version)> GetActivePrompt(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT body, version FROM prompts WHERE active = true LIMIT 1", db);
+
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+    {
+        var body = reader.GetString(0);
+        var version = reader.GetString(1);
+        return (body, version);
+    }
+
+    return ("You are an assistant.", "none");
+}
 
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
