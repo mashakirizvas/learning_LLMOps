@@ -25,7 +25,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // TODO(student, W4)
 
     // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    var model = Route(body.Message, defaultModel);  // routing (W2)  // TODO(student, W2)
 
     // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
     string systemPrompt;
@@ -161,7 +161,28 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     return Results.Ok(new { activated = version });
 });
 
-app.Run("http://0.0.0.0:8080");
+app.Run("http://0.0.0.0:8080"); 
+
+// fallback chain: mock-strong -> mock-mini -> контрольована помилка
+
+
+static string Route(string message, string defaultModel) 
+{
+    string[] markers = { "поверн", "терміново", "скарг", "refund" };
+
+    if (string.IsNullOrWhiteSpace(message))
+        return "mock-mini";
+
+    var normalized = message.ToLowerInvariant();
+
+    foreach (var marker in markers)
+    {
+        if (normalized.Contains(marker))
+            return "mock-strong";
+    }
+
+    return "mock-mini";
+}
 
 static async Task<(string body, string version)> GetActivePrompt(string conn)
 {
