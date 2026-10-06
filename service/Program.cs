@@ -172,6 +172,9 @@ app.Run("http://0.0.0.0:8080");
 
 static string Route(string message, string defaultModel, bool degraded)
 {
+    if (defaultModel != "mock")
+        return defaultModel;
+    
     // політика: на 80%+ бюджету не підіймаємось до strong — деградація
     if (degraded)
         return "mock-mini";
