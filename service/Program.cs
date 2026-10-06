@@ -33,8 +33,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = Route(body.Message, defaultModel);  // routing (W2)  // TODO(student, W2)
+        var spentToday = await GetTodayCost(dbConn);
+    var degraded = spentToday >= 0.8m * budgetUsd;
+    var model = Route(body.Message, defaultModel, degraded);
 
     // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
     string systemPrompt;
@@ -121,24 +122,10 @@ catch
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
-app.MapGet("/prompts", async () =>
+app.MapGet("/cost", async () =>
 {
-    var result = new List<object>();
-    await using var db = new NpgsqlConnection(dbConn);
-    await db.OpenAsync();
-    await using var cmd = new NpgsqlCommand(
-        "SELECT name, version, active FROM prompts WHERE name = 'support-system' ORDER BY version", db);
-    await using var reader = await cmd.ExecuteReaderAsync();
-    while (await reader.ReadAsync())
-    {
-        result.Add(new {
-            name = reader.GetString(0),
-            version = reader.GetString(1),
-            active = reader.GetBoolean(2)
-        });
-    }
-    return Results.Json(result);
+    var todayUsd = await GetTodayCost(dbConn);
+    return Results.Json(new { today_usd = todayUsd, budget_usd = budgetUsd });
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
@@ -177,11 +164,18 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
 
 app.Run("http://0.0.0.0:8080"); 
 
+// політика на 80% бюджету ($4.00): деградація — роутер примусово віддає
+// mock-mini замість mock-strong, щоб сервіс лишався живим, не перевищивши ліміт.
+
 // fallback chain: mock-strong -> mock-mini -> контрольована помилка
 
 
-static string Route(string message, string defaultModel) 
+static string Route(string message, string defaultModel, bool degraded)
 {
+    // політика: на 80%+ бюджету не підіймаємось до strong — деградація
+    if (degraded)
+        return "mock-mini";
+
     string[] markers = { "поверн", "терміново", "скарг", "refund" };
 
     if (string.IsNullOrWhiteSpace(message))
@@ -214,6 +208,17 @@ static async Task<(string body, string version)> GetActivePrompt(string conn)
     }
 
     return ("You are an assistant.", "none");
+}
+
+
+static async Task<decimal> GetTodayCost(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests WHERE created_at::date = CURRENT_DATE", db);
+    var result = await cmd.ExecuteScalarAsync();
+    return result != null && result != DBNull.Value ? Convert.ToDecimal(result) : 0m;
 }
 
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
