@@ -16,6 +16,15 @@ var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 
+// cost (W2): ціна в USD за 1k токенів. (in, out) — output дорожчий за input,
+// strong помітно дорожча за mini. null-тариф → cost_usd лишиться null.
+var prices = new Dictionary<string, (decimal In, decimal Out)>
+{
+    ["mock-mini"]   = (0.00015m, 0.00060m),
+    ["mock-strong"] = (0.00300m, 0.01500m),
+};
+var budgetUsd = 5.00m;
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -96,7 +105,12 @@ catch
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
     // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+        decimal? costUsd = null;  // null, якщо для моделі немає тарифу
+    if (prices.TryGetValue(model, out var price))
+    {
+        costUsd = promptTokens / 1000m * price.In
+                + completionTokens / 1000m * price.Out;
+    }
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
