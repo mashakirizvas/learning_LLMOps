@@ -33,8 +33,13 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
+            var degraded = false;
+    try
+    {
         var spentToday = await GetTodayCost(dbConn);
-    var degraded = spentToday >= 0.8m * budgetUsd;
+        degraded = spentToday >= 0.8m * budgetUsd;
+    }
+    catch { /* БД недоступна — без деградації, не валимо запит */ }
     var model = Route(body.Message, defaultModel, degraded);
 
     // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
@@ -107,7 +112,7 @@ catch
 
     // cost (W2): порахувати tokens * ціна і покласти в cost_usd
         decimal? costUsd = null;  // null, якщо для моделі немає тарифу
-    if (prices.TryGetValue(model, out var price))
+        if (status is >= 200 and < 300 && prices.TryGetValue(model, out var price))
     {
         costUsd = promptTokens / 1000m * price.In
                 + completionTokens / 1000m * price.Out;
@@ -126,6 +131,26 @@ app.MapGet("/cost", async () =>
 {
     var todayUsd = await GetTodayCost(dbConn);
     return Results.Json(new { today_usd = todayUsd, budget_usd = budgetUsd });
+});
+
+
+app.MapGet("/prompts", async () =>
+{
+    var result = new List<object>();
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT name, version, active FROM prompts WHERE name = 'support-system' ORDER BY version", db);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    while (await reader.ReadAsync())
+    {
+        result.Add(new {
+            name = reader.GetString(0),
+            version = reader.GetString(1),
+            active = reader.GetBoolean(2)
+        });
+    }
+    return Results.Json(result);
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
