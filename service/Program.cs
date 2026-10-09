@@ -16,6 +16,15 @@ var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 
+// cost (W2): ціна в USD за 1k токенів. (in, out) — output дорожчий за input,
+// strong помітно дорожча за mini. null-тариф → cost_usd лишиться null.
+var prices = new Dictionary<string, (decimal In, decimal Out)>
+{
+    ["mock-mini"]   = (0.00015m, 0.00060m),
+    ["mock-strong"] = (0.00300m, 0.01500m),
+};
+var budgetUsd = 5.00m;
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -24,8 +33,14 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+            var degraded = false;
+    try
+    {
+        var spentToday = await GetTodayCost(dbConn);
+        degraded = spentToday >= 0.8m * budgetUsd;
+    }
+    catch { /* БД недоступна — без деградації, не валимо запит */ }
+    var model = Route(body.Message, defaultModel, degraded);
 
     // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
     string systemPrompt;
@@ -96,7 +111,12 @@ catch
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
     // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+        decimal? costUsd = null;  // null, якщо для моделі немає тарифу
+        if (status is >= 200 and < 300 && prices.TryGetValue(model, out var price))
+    {
+        costUsd = promptTokens / 1000m * price.In
+                + completionTokens / 1000m * price.Out;
+    }
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
@@ -107,7 +127,13 @@ catch
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
+app.MapGet("/cost", async () =>
+{
+    var todayUsd = await GetTodayCost(dbConn);
+    return Results.Json(new { today_usd = todayUsd, budget_usd = budgetUsd });
+});
+
+
 app.MapGet("/prompts", async () =>
 {
     var result = new List<object>();
@@ -161,7 +187,38 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     return Results.Ok(new { activated = version });
 });
 
-app.Run("http://0.0.0.0:8080");
+app.Run("http://0.0.0.0:8080"); 
+
+// політика на 80% бюджету ($4.00): деградація — роутер примусово віддає
+// mock-mini замість mock-strong, щоб сервіс лишався живим, не перевищивши ліміт.
+
+// fallback chain: mock-strong -> mock-mini -> контрольована помилка
+
+
+static string Route(string message, string defaultModel, bool degraded)
+{
+    if (defaultModel != "mock")
+        return defaultModel;
+    
+    // політика: на 80%+ бюджету не підіймаємось до strong — деградація
+    if (degraded)
+        return "mock-mini";
+
+    string[] markers = { "поверн", "терміново", "скарг", "refund" };
+
+    if (string.IsNullOrWhiteSpace(message))
+        return "mock-mini";
+
+    var normalized = message.ToLowerInvariant();
+
+    foreach (var marker in markers)
+    {
+        if (normalized.Contains(marker))
+            return "mock-strong";
+    }
+
+    return "mock-mini";
+}
 
 static async Task<(string body, string version)> GetActivePrompt(string conn)
 {
@@ -179,6 +236,17 @@ static async Task<(string body, string version)> GetActivePrompt(string conn)
     }
 
     return ("You are an assistant.", "none");
+}
+
+
+static async Task<decimal> GetTodayCost(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests WHERE created_at::date = CURRENT_DATE", db);
+    var result = await cmd.ExecuteScalarAsync();
+    return result != null && result != DBNull.Value ? Convert.ToDecimal(result) : 0m;
 }
 
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
