@@ -5,6 +5,8 @@
 using System.Text;
 using System.Text.Json;
 using Npgsql;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
@@ -23,7 +25,21 @@ var prices = new Dictionary<string, (decimal In, decimal Out)>
     ["mock-mini"]   = (0.00015m, 0.00060m),
     ["mock-strong"] = (0.00300m, 0.01500m),
 };
+
+var cache = new ConcurrentDictionary<string, CacheEntry>();
+var cacheTtl = TimeSpan.FromMinutes(10);
+var cacheHits = 0;
+var cacheMisses = 0;
+
 var budgetUsd = 5.00m;
+
+// tools (W3): реєстр інструментів як дані. category: read = оборотне (авто),
+// irreversible = незворотне (не виконуємо, ескалюємо на людину).
+var tools_registry = new Dictionary<string, ToolSpec>
+{
+    ["lookup_order"]  = new ToolSpec("read", 2000),
+    ["create_ticket"] = new ToolSpec("irreversible", 2000),
+};
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -57,8 +73,19 @@ catch
     return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
 }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
-    // TODO(student, W3)
+var cacheKey = CacheKey(systemPrompt, body.Message);
+
+    if (cache.TryGetValue(cacheKey, out var cached)
+        && DateTimeOffset.UtcNow - cached.StoredAt < cacheTtl)
+    {
+        Interlocked.Increment(ref cacheHits);
+        var hitMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        Console.WriteLine($"[cache] HIT  {cacheKey[..8]} hits={cacheHits} miss={cacheMisses}");
+        await LogRequest(dbConn, requestId, model, promptVersion, hitMs, 0, 0, 0m, 200);
+        return Results.Json(new { request_id = requestId, content = cached.Answer, tool = (string?)null, latency_ms = hitMs, cache = "hit" });
+    }
+    Interlocked.Increment(ref cacheMisses);
+    Console.WriteLine($"[cache] MISS {cacheKey[..8]} hits={cacheHits} miss={cacheMisses}");
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -95,6 +122,9 @@ catch
             && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
         {
             toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            var toolResult = RunTool(toolCall, tools_registry);
+            answer = $"{answer} ({toolResult})";
+
         }
 
         var usage = doc.RootElement.GetProperty("usage");
@@ -117,6 +147,12 @@ catch
         costUsd = promptTokens / 1000m * price.In
                 + completionTokens / 1000m * price.Out;
     }
+
+
+    // cache (W3): зберігаємо лише успішні відповіді без tool-виклику.
+    // персональний стан / результат інструмента не кешуємо (межа — п.4).
+    if (status is >= 200 and < 300 && toolCall is null)
+        cache[cacheKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
@@ -194,6 +230,29 @@ app.Run("http://0.0.0.0:8080");
 
 // fallback chain: mock-strong -> mock-mini -> контрольована помилка
 
+static string RunTool(string name, Dictionary<string, ToolSpec> registry)
+{
+    if (!registry.TryGetValue(name, out var spec))
+        return $"unknown tool: {name}";
+
+    // незворотні дії не виконуємо автономно — ескалація на людину (/approvals, Тема 8)
+    if (spec.Category == "irreversible")
+        return "escalated: pending human approval";
+
+    // оборотні (read) виконуємо одразу
+    return name switch
+    {
+        "lookup_order" => "статус: оплачено, доставку призначено",
+        _ => $"no handler: {name}"
+    };
+}
+
+static string CacheKey(string prompt, string message)
+{
+    var raw = $"{prompt}\n{message.Trim()}";
+    var hash = SHA256.HashData(Encoding.UTF8.GetBytes(raw));
+    return Convert.ToHexString(hash);
+}
 
 static string Route(string message, string defaultModel, bool degraded)
 {
@@ -273,3 +332,6 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
 }
 
 record ChatIn(string Message);
+record CacheEntry(string Answer, DateTimeOffset StoredAt);
+record ToolSpec(string Category, int TimeoutMs);
+
