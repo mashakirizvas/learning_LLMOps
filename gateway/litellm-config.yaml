@@ -41,6 +41,11 @@ model_list:
       model: mistral/mistral-large-latest
       api_key: os.environ/MISTRAL_API_KEY
 
+  - model_name: text-embedding-3-small
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY   
+
   # Anthropic — друга родина реальних моделей, ключ окремий: ANTHROPIC_API_KEY.
   # Імена тут теж alias'и, а не снапшоти — усе, що написано вище про gpt-5-mini,
   # стосується і їх.

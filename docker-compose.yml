@@ -11,7 +11,10 @@ services:
       - GATEWAY_URL=http://gateway:4000
       - DB_CONN=Host=postgres;Database=llmops;Username=llmops;Password=llmops
       - MODEL=${MODEL:-mock}   # mock (за замовч.) або gpt-5-mini / claude-haiku (потрібен ключ у gateway/.env)
+      - SEMANTIC_THRESHOLD=${SEMANTIC_THRESHOLD:-0.85}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
     depends_on: [gateway, postgres]
+     
 
   gateway:
     # nightly-тег рухомий — пінимо перевірений digest, щоб у всіх студентів був той самий gateway
