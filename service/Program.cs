@@ -30,10 +30,26 @@ var prices = new Dictionary<string, (decimal In, decimal Out)>
 
 var cache = new ConcurrentDictionary<string, CacheEntry>();
 var redisConn = Environment.GetEnvironmentVariable("REDIS_CONN") ?? "redis:6379";
-var redis = ConnectionMultiplexer.Connect(redisConn);
-var redisDb = redis.GetDatabase();
-var redisServer = redis.GetServer(redisConn);
-Console.WriteLine($"[redis] ping = {redisDb.Ping().TotalMilliseconds}ms");
+IDatabase? redisDb = null;
+IServer? redisServer = null;
+try
+{
+    var redis = ConnectionMultiplexer.Connect($"{redisConn},abortConnect=false,connectTimeout=2000");
+    if (redis.IsConnected)
+    {
+        redisDb = redis.GetDatabase();
+        redisServer = redis.GetServer(redisConn);
+        Console.WriteLine($"[redis] ping = {redisDb.Ping().TotalMilliseconds}ms");
+    }
+    else
+    {
+        Console.WriteLine("[redis] not connected, semantic cache off");
+    }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[redis] unavailable, semantic cache off: {ex.GetType().Name}");
+}
 var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
@@ -98,21 +114,25 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     Interlocked.Increment(ref cacheMisses);
     Console.WriteLine($"[cache] MISS {cacheKey[..8]} hits={cacheHits} miss={cacheMisses}");
 
-    // --- семантичний кеш (другий ешелон після точного) ---
-    var httpEmb = httpFactory.CreateClient();
-    var queryVector = await GetEmbedding(body.Message, gateway, embeddingModel, httpEmb);
-
-    var (semAnswer, semScore) = await SearchSemanticCache(redisDb, redisServer, model, queryVector, cacheTtl);
-
-    if (semAnswer is not null && semScore >= semanticThreshold)
+        // --- семантичний кеш (другий ешелон після точного; лише якщо Redis доступний) ---
+    float[]? queryVector = null;
+    if (redisDb != null && redisServer != null)
     {
-        Interlocked.Increment(ref cacheHits);
-        var semMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-        Console.WriteLine($"[semantic] HIT score={semScore:F4} >= {semanticThreshold}");
-        await LogRequest(dbConn, requestId, model, promptVersion, semMs, 0, 0, 0m, 200);
-        return Results.Json(new { request_id = requestId, content = semAnswer, tool = (string?)null, latency_ms = semMs, cache = "semantic" });
+        var httpEmb = httpFactory.CreateClient();
+        queryVector = await GetEmbedding(body.Message, gateway, embeddingModel, httpEmb);
+
+        var (semAnswer, semScore) = await SearchSemanticCache(redisDb, redisServer, model, queryVector, cacheTtl);
+
+        if (semAnswer is not null && semScore >= semanticThreshold)
+        {
+            Interlocked.Increment(ref cacheHits);
+            var semMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+            Console.WriteLine($"[semantic] HIT score={semScore:F4} >= {semanticThreshold}");
+            await LogRequest(dbConn, requestId, model, promptVersion, semMs, 0, 0, 0m, 200);
+            return Results.Json(new { request_id = requestId, content = semAnswer, tool = (string?)null, latency_ms = semMs, cache = "semantic" });
+        }
+        Console.WriteLine($"[semantic] MISS best_score={semScore:F4} < {semanticThreshold}");
     }
-    Console.WriteLine($"[semantic] MISS best_score={semScore:F4} < {semanticThreshold}");
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -178,6 +198,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     if (status is >= 200 and < 300 && toolCall is null)
     {
         cache[cacheKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
+        if (redisDb != null && queryVector != null)
         await SaveToSemanticCache(redisDb, model, queryVector, answer);
     }
 
