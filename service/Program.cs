@@ -53,6 +53,7 @@ catch (Exception ex)
 var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
+var fallbacks = 0;
 
 var budgetUsd = 5.00m;
 
@@ -134,53 +135,48 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         Console.WriteLine($"[semantic] MISS best_score={semScore:F4} < {semanticThreshold}");
     }
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
+    // fallback (W4): пробуємо моделі по черзі. На mock другий елемент — той самий
+    // процес (справжнього fallback на незалежну модель лаба не відтворює), але
+    // перебір кандидатів і обробку повної відмови це перевіряє. З реальним ключем
+    // другим стане інша модель, і порядок із Теми 3 вставиться сюди без змін.
+    var chain = defaultModel == "mock"
+        ? new[] { model, "mock" }
+        : new[] { model, "azure-gpt-5" };
 
     var http = httpFactory.CreateClient();
     var answer = "";
     string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    try
+    int promptTokens = 0, completionTokens = 0, status = 0;
+    var ok = false;
+
+    for (int i = 0; i < chain.Length && !ok; i++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
+        if (i > 0) Interlocked.Increment(ref fallbacks);
 
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
+        var res = await CallGateway(http, gateway, chain[i], systemPrompt, body.Message, tools_registry);
 
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину.
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        if (res.ok)
         {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
-        var toolResult = await RunTool(toolCall, tools_registry);
-            answer = $"{answer} ({toolResult})";
+            ok = true;
+            model = chain[i];
+            answer = res.answer;
+            toolCall = res.tool;
+            promptTokens = res.pt;
+            completionTokens = res.ct;
+            status = res.status;
         }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+        else
+        {
+            status = res.status;
+        }
     }
-    catch
+
+    // контрольована відмова (W4): весь ланцюг упав. Ввічлива заглушка користувачу,
+    // чесний 503 у лог. status==0 (мережі не було) теж стає 503 — у лозі не має бути 0.
+    if (!ok)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        answer = "Вибачте, тимчасові проблеми на нашому боці. Спробуйте, будь ласка, трохи згодом.";
+        status = (status == 200 || status == 0) ? 503 : status;
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -275,6 +271,61 @@ app.Run("http://0.0.0.0:8080");
 // політика на 80% бюджету ($4.00): деградація — роутер примусово віддає
 // mock-mini замість mock-strong, щоб сервіс лишався живим, не перевищивши ліміт.
 // fallback chain: mock-strong -> mock-mini -> контрольована помилка
+
+// [W4] один виклик моделі через gateway. Збій повертаємо як значення (ok=false),
+// а не кидаємо виняток — щоб fallback-цикл міг обробити його і піти далі.
+static async Task<(bool ok, string answer, string? tool, int pt, int ct, int status)>
+    CallGateway(HttpClient http, string gateway, string model, string system, string user,
+        Dictionary<string, ToolSpec> registry)
+{
+        var payload = JsonSerializer.Serialize(new
+    {
+        model,
+        messages = new object[]
+        {
+            new { role = "system", content = system },
+            new { role = "user", content = user }
+        }
+    });
+
+    var answer = "";
+    string? toolCall = null;
+    int promptTokens = 0, completionTokens = 0, status = 0;
+
+    try
+    {
+        var response = await http.PostAsync(
+            $"{gateway}/v1/chat/completions",
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+        status = (int)response.StatusCode;
+
+        if (status >= 400)
+            return (false, "", null, 0, 0, status);
+
+        var rawJson = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(rawJson);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        answer = message.GetProperty("content").GetString() ?? "";
+
+        if (message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        {
+            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            var toolResult = await RunTool(toolCall, registry);
+            answer = $"{answer} ({toolResult})";
+        }
+
+        var usage = doc.RootElement.GetProperty("usage");
+        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
+        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+    }
+    catch
+    {
+        return (false, "", null, 0, 0, 0);
+    }
+
+    return (true, answer, toolCall, promptTokens, completionTokens, status);
+}
 
 static async Task<string> RunTool(string name, Dictionary<string, ToolSpec> registry)
 {
