@@ -8,6 +8,7 @@ using Npgsql;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using StackExchange.Redis;
+using System.Text.RegularExpressions;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
@@ -53,6 +54,7 @@ catch (Exception ex)
 var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
+var fallbacks = 0;
 
 var budgetUsd = 5.00m;
 
@@ -70,13 +72,17 @@ var tools_registry = new Dictionary<string, ToolSpec>
     ["create_ticket"] = new ToolSpec("irreversible", 2000),
 };
 
+// [W4] черга підтверджень (HITL): id -> (дія, результат).
+// result == null => заявка ще очікує рішення оператора.
+var approvals = new ConcurrentDictionary<string, Approval>();
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): маскуємо PII до моделі, кешу й логу
+    var userMessage = MaskPii(body.Message);
 
     var degraded = false;
     try
@@ -85,7 +91,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         degraded = spentToday >= 0.8m * budgetUsd;
     }
     catch { /* БД недоступна — без деградації, не валимо запит */ }
-    var model = Route(body.Message, defaultModel, degraded);
+    var model = Route(userMessage, defaultModel, degraded);
 
     // промпт (W1): береться з реєстру (таблиця prompts) з версією
     string systemPrompt;
@@ -100,7 +106,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
     }
 
-    var cacheKey = CacheKey(model, systemPrompt, body.Message);
+    var cacheKey = CacheKey(model, systemPrompt, userMessage);
 
     if (cache.TryGetValue(cacheKey, out var cached)
         && DateTimeOffset.UtcNow - cached.StoredAt < cacheTtl)
@@ -119,7 +125,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     if (redisDb != null && redisServer != null)
     {
         var httpEmb = httpFactory.CreateClient();
-        queryVector = await GetEmbedding(body.Message, gateway, embeddingModel, httpEmb);
+        queryVector = await GetEmbedding(userMessage, gateway, embeddingModel, httpEmb);
 
         var (semAnswer, semScore) = await SearchSemanticCache(redisDb, redisServer, model, queryVector, cacheTtl);
 
@@ -134,53 +140,68 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         Console.WriteLine($"[semantic] MISS best_score={semScore:F4} < {semanticThreshold}");
     }
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
+    // fallback (W4): пробуємо моделі по черзі. На mock другий елемент — той самий
+    // процес (справжнього fallback на незалежну модель лаба не відтворює), але
+    // перебір кандидатів і обробку повної відмови це перевіряє. З реальним ключем
+    // другим стане інша модель, і порядок із Теми 3 вставиться сюди без змін.
+    var chain = defaultModel == "mock"
+        ? new[] { model, "mock" }
+        : new[] { model, "azure-gpt-5" };
 
     var http = httpFactory.CreateClient();
     var answer = "";
     string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    try
+    int promptTokens = 0, completionTokens = 0, status = 0;
+    var ok = false;
+
+    for (int i = 0; i < chain.Length && !ok; i++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
+        if (i > 0) Interlocked.Increment(ref fallbacks);
 
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
+        var res = await CallGateway(http, gateway, chain[i], systemPrompt, userMessage, tools_registry);
 
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину.
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        if (res.ok)
         {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
-        var toolResult = await RunTool(toolCall, tools_registry);
-            answer = $"{answer} ({toolResult})";
+            ok = true;
+            model = chain[i];
+            answer = res.answer;
+            toolCall = res.tool;
+            promptTokens = res.pt;
+            completionTokens = res.ct;
+            status = res.status;
         }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+        else
+        {
+            status = res.status;
+        }
     }
-    catch
+
+    // контрольована відмова (W4): весь ланцюг упав. Ввічлива заглушка користувачу,
+    // чесний 503 у лог. status==0 (мережі не було) теж стає 503 — у лозі не має бути 0.
+    if (!ok)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        answer = "Вибачте, тимчасові проблеми на нашому боці. Спробуйте, будь ласка, трохи згодом.";
+        status = (status == 200 || status == 0) ? 503 : status;
+    }
+
+    // tools + HITL (W4): read-only виконуємо одразу; незворотну дію — через заявку.
+    // Навіть якщо injection змусив модель запропонувати незворотну дію — вона
+    // не виконається без підтвердження людини (обмеження радіуса ураження).
+    if (ok && toolCall is not null)
+    {
+        tools_registry.TryGetValue(toolCall, out var spec);
+
+        if (spec is not null && spec.Category == "irreversible")
+        {
+            var id = Guid.NewGuid().ToString("N")[..6];
+            approvals[id] = new Approval(toolCall, "pending", null);
+            answer += $" (очікує підтвердження оператора, id={id})";
+        }
+        else
+        {
+            var toolResult = await RunTool(toolCall, tools_registry);
+            answer += $" ({toolResult})";
+        }
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -237,7 +258,16 @@ app.MapGet("/prompts", async () =>
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));
+// [W4] HITL: оператор бачить заявки, що очікують рішення (result == null).
+// Форма { pending: [{ id, action }] } — саме її читає картка Approvals у консолі.
+app.MapGet("/approvals", () =>
+{
+    var pending = approvals
+        .Where(kv => kv.Value.Result == null)
+        .Select(kv => new { id = kv.Key, action = kv.Value.Action })
+        .ToList();
+    return Results.Json(new { pending });
+});
 
 app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest request) =>
 {
@@ -270,25 +300,94 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     return Results.Ok(new { activated = version });
 });
 
+// [W4] HITL: підтвердження заявки оператором -> виконати інструмент.
+// Атомарний захват (TryUpdate pending->in-progress) проти check-then-act:
+// одночасні/повторні approve не створять другий тікет.
+app.MapPost("/approvals/{id}/approve", async (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var a) || a.Result != null)
+        return Results.NotFound(new { error = "already done" });
+
+    // атомарно забираємо заявку з pending — виконає лише той, кому це вдалось
+    var inProgress = a with { Status = "in-progress" };
+    if (!approvals.TryUpdate(id, inProgress, a))
+        return Results.NotFound(new { error = "already done" });
+
+    var result = await RunTool(a.Action, tools_registry);
+    approvals[id] = inProgress with { Status = "approved", Result = result };
+    return Results.Ok(new { id, result });
+});
+
 app.Run("http://0.0.0.0:8080");
 
 // політика на 80% бюджету ($4.00): деградація — роутер примусово віддає
 // mock-mini замість mock-strong, щоб сервіс лишався живим, не перевищивши ліміт.
 // fallback chain: mock-strong -> mock-mini -> контрольована помилка
 
+// [W4] один виклик моделі через gateway. Збій повертаємо як значення (ok=false),
+// а не кидаємо виняток — щоб fallback-цикл міг обробити його і піти далі.
+static async Task<(bool ok, string answer, string? tool, int pt, int ct, int status)>
+    CallGateway(HttpClient http, string gateway, string model, string system, string user,
+        Dictionary<string, ToolSpec> registry)
+{
+        var payload = JsonSerializer.Serialize(new
+    {
+        model,
+        messages = new object[]
+        {
+            new { role = "system", content = system },
+            new { role = "user", content = user }
+        }
+    });
+
+    var answer = "";
+    string? toolCall = null;
+    int promptTokens = 0, completionTokens = 0, status = 0;
+
+    try
+    {
+        var response = await http.PostAsync(
+            $"{gateway}/v1/chat/completions",
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+        status = (int)response.StatusCode;
+
+        if (status >= 400)
+            return (false, "", null, 0, 0, status);
+
+        var rawJson = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(rawJson);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        answer = message.GetProperty("content").GetString() ?? "";
+
+        if (message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        {
+            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+        }
+
+        var usage = doc.RootElement.GetProperty("usage");
+        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
+        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+    }
+    catch
+    {
+        return (false, "", null, 0, 0, 0);
+    }
+
+    return (true, answer, toolCall, promptTokens, completionTokens, status);
+}
+
 static async Task<string> RunTool(string name, Dictionary<string, ToolSpec> registry)
 {
     if (!registry.TryGetValue(name, out var spec))
         return $"unknown tool: {name}";
 
-    // незворотні дії не виконуємо автономно — ескалація на людину (/approvals, Тема 8)
-    if (spec.Category == "irreversible")
-        return "escalated: pending human approval";
 
     // саме виконання інструмента (на W4 — реальний виклик у зовнішню систему)
     async Task<string> Execute() => name switch
     {
         "lookup_order" => "статус: оплачено, доставку призначено",
+        "create_ticket" => $"тікет #T-{Guid.NewGuid().ToString("N")[..4]}",
         _ => $"no handler: {name}"
     };
 
@@ -303,6 +402,11 @@ static async Task<string> RunTool(string name, Dictionary<string, ToolSpec> regi
         return $"tool timeout after {spec.TimeoutMs}ms: {name}";
     }
 }
+
+// [W4] guardrail: маскуємо email ДО моделі, кешу й логу — PII не має
+// витікати провайдеру чи в сховища. Regex — навчальне спрощення.
+static string MaskPii(string s) =>
+    Regex.Replace(s, @"[\w.\-]+@[\w.\-]+", "[email]");
 
 static string CacheKey(string model, string prompt, string message)
 {
@@ -475,3 +579,4 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
 record ChatIn(string Message);
 record CacheEntry(string Answer, DateTimeOffset StoredAt);
 record ToolSpec(string Category, int TimeoutMs);
+record Approval(string Action, string Status, string? Result);
