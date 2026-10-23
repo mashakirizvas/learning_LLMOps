@@ -8,6 +8,7 @@ using Npgsql;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using StackExchange.Redis;
+using System.Text.RegularExpressions;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
@@ -71,13 +72,17 @@ var tools_registry = new Dictionary<string, ToolSpec>
     ["create_ticket"] = new ToolSpec("irreversible", 2000),
 };
 
+// [W4] черга підтверджень (HITL): id -> (дія, результат).
+// result == null => заявка ще очікує рішення оператора.
+var approvals = new ConcurrentDictionary<string, Approval>();
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): маскуємо PII до моделі, кешу й логу
+    var userMessage = MaskPii(body.Message);
 
     var degraded = false;
     try
@@ -86,7 +91,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         degraded = spentToday >= 0.8m * budgetUsd;
     }
     catch { /* БД недоступна — без деградації, не валимо запит */ }
-    var model = Route(body.Message, defaultModel, degraded);
+    var model = Route(userMessage, defaultModel, degraded);
 
     // промпт (W1): береться з реєстру (таблиця prompts) з версією
     string systemPrompt;
@@ -101,7 +106,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
     }
 
-    var cacheKey = CacheKey(model, systemPrompt, body.Message);
+    var cacheKey = CacheKey(model, systemPrompt, userMessage);
 
     if (cache.TryGetValue(cacheKey, out var cached)
         && DateTimeOffset.UtcNow - cached.StoredAt < cacheTtl)
@@ -120,7 +125,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     if (redisDb != null && redisServer != null)
     {
         var httpEmb = httpFactory.CreateClient();
-        queryVector = await GetEmbedding(body.Message, gateway, embeddingModel, httpEmb);
+        queryVector = await GetEmbedding(userMessage, gateway, embeddingModel, httpEmb);
 
         var (semAnswer, semScore) = await SearchSemanticCache(redisDb, redisServer, model, queryVector, cacheTtl);
 
@@ -153,7 +158,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     {
         if (i > 0) Interlocked.Increment(ref fallbacks);
 
-        var res = await CallGateway(http, gateway, chain[i], systemPrompt, body.Message, tools_registry);
+        var res = await CallGateway(http, gateway, chain[i], systemPrompt, userMessage, tools_registry);
 
         if (res.ok)
         {
@@ -177,6 +182,26 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     {
         answer = "Вибачте, тимчасові проблеми на нашому боці. Спробуйте, будь ласка, трохи згодом.";
         status = (status == 200 || status == 0) ? 503 : status;
+    }
+
+    // tools + HITL (W4): read-only виконуємо одразу; незворотну дію — через заявку.
+    // Навіть якщо injection змусив модель запропонувати незворотну дію — вона
+    // не виконається без підтвердження людини (обмеження радіуса ураження).
+    if (ok && toolCall is not null)
+    {
+        tools_registry.TryGetValue(toolCall, out var spec);
+
+        if (spec is not null && spec.Category == "irreversible")
+        {
+            var id = Guid.NewGuid().ToString("N")[..6];
+            approvals[id] = new Approval(toolCall, "pending", null);
+            answer += $" (очікує підтвердження оператора, id={id})";
+        }
+        else
+        {
+            var toolResult = await RunTool(toolCall, tools_registry);
+            answer += $" ({toolResult})";
+        }
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -233,7 +258,16 @@ app.MapGet("/prompts", async () =>
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));
+// [W4] HITL: оператор бачить заявки, що очікують рішення (result == null).
+// Форма { pending: [{ id, action }] } — саме її читає картка Approvals у консолі.
+app.MapGet("/approvals", () =>
+{
+    var pending = approvals
+        .Where(kv => kv.Value.Result == null)
+        .Select(kv => new { id = kv.Key, action = kv.Value.Action })
+        .ToList();
+    return Results.Json(new { pending });
+});
 
 app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest request) =>
 {
@@ -264,6 +298,24 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
 
     await tx.CommitAsync();
     return Results.Ok(new { activated = version });
+});
+
+// [W4] HITL: підтвердження заявки оператором -> виконати інструмент.
+// Атомарний захват (TryUpdate pending->in-progress) проти check-then-act:
+// одночасні/повторні approve не створять другий тікет.
+app.MapPost("/approvals/{id}/approve", async (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var a) || a.Result != null)
+        return Results.NotFound(new { error = "already done" });
+
+    // атомарно забираємо заявку з pending — виконає лише той, кому це вдалось
+    var inProgress = a with { Status = "in-progress" };
+    if (!approvals.TryUpdate(id, inProgress, a))
+        return Results.NotFound(new { error = "already done" });
+
+    var result = await RunTool(a.Action, tools_registry);
+    approvals[id] = inProgress with { Status = "approved", Result = result };
+    return Results.Ok(new { id, result });
 });
 
 app.Run("http://0.0.0.0:8080");
@@ -311,8 +363,6 @@ static async Task<(bool ok, string answer, string? tool, int pt, int ct, int sta
             && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
         {
             toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
-            var toolResult = await RunTool(toolCall, registry);
-            answer = $"{answer} ({toolResult})";
         }
 
         var usage = doc.RootElement.GetProperty("usage");
@@ -332,14 +382,12 @@ static async Task<string> RunTool(string name, Dictionary<string, ToolSpec> regi
     if (!registry.TryGetValue(name, out var spec))
         return $"unknown tool: {name}";
 
-    // незворотні дії не виконуємо автономно — ескалація на людину (/approvals, Тема 8)
-    if (spec.Category == "irreversible")
-        return "escalated: pending human approval";
 
     // саме виконання інструмента (на W4 — реальний виклик у зовнішню систему)
     async Task<string> Execute() => name switch
     {
         "lookup_order" => "статус: оплачено, доставку призначено",
+        "create_ticket" => $"тікет #T-{Guid.NewGuid().ToString("N")[..4]}",
         _ => $"no handler: {name}"
     };
 
@@ -354,6 +402,11 @@ static async Task<string> RunTool(string name, Dictionary<string, ToolSpec> regi
         return $"tool timeout after {spec.TimeoutMs}ms: {name}";
     }
 }
+
+// [W4] guardrail: маскуємо email ДО моделі, кешу й логу — PII не має
+// витікати провайдеру чи в сховища. Regex — навчальне спрощення.
+static string MaskPii(string s) =>
+    Regex.Replace(s, @"[\w.\-]+@[\w.\-]+", "[email]");
 
 static string CacheKey(string model, string prompt, string message)
 {
@@ -526,3 +579,4 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
 record ChatIn(string Message);
 record CacheEntry(string Answer, DateTimeOffset StoredAt);
 record ToolSpec(string Category, int TimeoutMs);
+record Approval(string Action, string Status, string? Result);
