@@ -55,6 +55,15 @@ var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
 var fallbacks = 0;
+var providerFails = new ConcurrentDictionary<string, int>();
+// таксономія помилок (W5 опційно): окремі лічильники за причиною збою.
+// На mock реально зростають provider_429/provider_503/db_error;
+// tool_timeout і guardrail_refusal на mock не виникають (exec миттєвий,
+// refusal дає провайдер) — лишаються 0, чесно позначено в PR.
+var errProvider429 = 0;
+var errProvider503 = 0;
+var errDbError = 0;
+const int degradeAfter = 3;
 
 var budgetUsd = 5.00m;
 
@@ -102,6 +111,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
     catch
     {
+        Interlocked.Increment(ref errDbError);
         Console.Error.WriteLine($"[{requestId}] DB unavailable, cannot load prompt");
         return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
     }
@@ -160,7 +170,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
         var res = await CallGateway(http, gateway, chain[i], systemPrompt, userMessage, tools_registry);
 
-        if (res.ok)
+             if (res.ok)
         {
             ok = true;
             model = chain[i];
@@ -169,12 +179,16 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             promptTokens = res.pt;
             completionTokens = res.ct;
             status = res.status;
+            providerFails[chain[i]] = 0;                         // успіх → лічильник збоїв нуль
         }
         else
         {
             status = res.status;
+            providerFails.AddOrUpdate(chain[i], 1, (_, n) => n + 1);  // збій → +1 поспіль
+            if (res.status == 429) Interlocked.Increment(ref errProvider429);
+            else if (res.status == 503 || res.status == 0) Interlocked.Increment(ref errProvider503);
         }
-    }
+     }       
 
     // контрольована відмова (W4): весь ланцюг упав. Ввічлива заглушка користувачу,
     // чесний 503 у лог. status==0 (мережі не було) теж стає 503 — у лозі не має бути 0.
@@ -218,9 +232,13 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // персональний стан / результат інструмента не кешуємо (межа — п.4).
     if (status is >= 200 and < 300 && toolCall is null)
     {
-        cache[cacheKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
+        // ключ рахуємо з моделі, що РЕАЛЬНО відповіла (model уже = chain[i] після fallback),
+        // а не з початкового вибору роутера — інакше відповідь резервної моделі
+        // осіла б під ключем основної і віддавалась би як її, коли основна оживе.
+        var writeKey = CacheKey(model, systemPrompt, userMessage);
+        cache[writeKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
         if (redisDb != null && queryVector != null)
-        await SaveToSemanticCache(redisDb, model, queryVector, answer);
+            await SaveToSemanticCache(redisDb, model, queryVector, answer);
     }
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
@@ -231,7 +249,49 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));
+app.MapGet("/observability", async () =>
+{
+    int requests = 0, p95 = 0;
+    double errorRate = 0;
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*), "
+            + "COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0), "
+            + "COALESCE(AVG(CASE WHEN status <> '200' THEN 1.0 ELSE 0 END) * 100, 0) "
+            + "FROM requests WHERE created_at::date = CURRENT_DATE", db);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            requests = reader.GetInt32(0);
+            p95 = (int)reader.GetDouble(1);
+            errorRate = reader.GetDouble(2);
+        }
+    }
+    catch { /* БД недоступна — віддаємо нулі, не валимо ендпоінт */ }
+
+    var totalCacheLookups = cacheHits + cacheMisses;
+    var cacheHitPct = totalCacheLookups == 0 ? 0 : Math.Round(cacheHits * 100.0 / totalCacheLookups, 1);
+
+    return Results.Json(new
+    {
+        p95_ms = p95,
+        requests,
+        cache_hit_pct = cacheHitPct,
+        error_rate_pct = Math.Round(errorRate, 1),
+        fallback_events = fallbacks,
+        errors = new
+        {
+            provider_429 = errProvider429,
+            provider_503 = errProvider503,
+            db_error = errDbError,
+            tool_timeout = 0,        // на mock не виникає (exec миттєвий)
+            guardrail_refusal = 0,   // refusal дає провайдер, не власний детект
+        },
+    });
+});
 app.MapGet("/cost", async () =>
 {
     var todayUsd = await GetTodayCost(dbConn);
@@ -257,7 +317,20 @@ app.MapGet("/prompts", async () =>
     return Results.Json(result);
 });
 
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));
+app.MapGet("/providers", () =>
+{
+    var models = defaultModel == "mock"
+        ? new[] { "mock-mini", "mock-strong", "mock" }
+        : new[] { defaultModel, "azure-gpt-5" };
+
+    var providers = models.Select(m => new
+    {
+        name = m,
+        status = providerFails.GetValueOrDefault(m, 0) >= degradeAfter ? "degraded" : "ok"
+    });
+
+    return Results.Json(new { providers });
+});
 // [W4] HITL: оператор бачить заявки, що очікують рішення (result == null).
 // Форма { pending: [{ id, action }] } — саме її читає картка Approvals у консолі.
 app.MapGet("/approvals", () =>
@@ -266,7 +339,15 @@ app.MapGet("/approvals", () =>
         .Where(kv => kv.Value.Result == null)
         .Select(kv => new { id = kv.Key, action = kv.Value.Action })
         .ToList();
-    return Results.Json(new { pending });
+
+    // виконані заявки з результатом — щоб інваріант «один approve = один тікет»
+    // можна було перевірити будь-коли, а не лише у відповіді на сам approve
+    var done = approvals
+        .Where(kv => kv.Value.Result != null)
+        .Select(kv => new { id = kv.Key, action = kv.Value.Action, result = kv.Value.Result })
+        .ToList();
+
+    return Results.Json(new { pending, done });
 });
 
 app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest request) =>
