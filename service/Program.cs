@@ -56,6 +56,13 @@ var cacheHits = 0;
 var cacheMisses = 0;
 var fallbacks = 0;
 var providerFails = new ConcurrentDictionary<string, int>();
+// таксономія помилок (W5 опційно): окремі лічильники за причиною збою.
+// На mock реально зростають provider_429/provider_503/db_error;
+// tool_timeout і guardrail_refusal на mock не виникають (exec миттєвий,
+// refusal дає провайдер) — лишаються 0, чесно позначено в PR.
+var errProvider429 = 0;
+var errProvider503 = 0;
+var errDbError = 0;
 const int degradeAfter = 3;
 
 var budgetUsd = 5.00m;
@@ -104,6 +111,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
     catch
     {
+        Interlocked.Increment(ref errDbError);
         Console.Error.WriteLine($"[{requestId}] DB unavailable, cannot load prompt");
         return Results.Json(new { error = "Service unavailable" }, statusCode: 503);
     }
@@ -162,7 +170,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
         var res = await CallGateway(http, gateway, chain[i], systemPrompt, userMessage, tools_registry);
 
-        if (res.ok)
+             if (res.ok)
         {
             ok = true;
             model = chain[i];
@@ -172,14 +180,15 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             completionTokens = res.ct;
             status = res.status;
             providerFails[chain[i]] = 0;                         // успіх → лічильник збоїв нуль
-
         }
         else
         {
             status = res.status;
             providerFails.AddOrUpdate(chain[i], 1, (_, n) => n + 1);  // збій → +1 поспіль
+            if (res.status == 429) Interlocked.Increment(ref errProvider429);
+            else if (res.status == 503 || res.status == 0) Interlocked.Increment(ref errProvider503);
         }
-    }
+     }       
 
     // контрольована відмова (W4): весь ланцюг упав. Ввічлива заглушка користувачу,
     // чесний 503 у лог. status==0 (мережі не було) теж стає 503 — у лозі не має бути 0.
@@ -273,6 +282,14 @@ app.MapGet("/observability", async () =>
         cache_hit_pct = cacheHitPct,
         error_rate_pct = Math.Round(errorRate, 1),
         fallback_events = fallbacks,
+        errors = new
+        {
+            provider_429 = errProvider429,
+            provider_503 = errProvider503,
+            db_error = errDbError,
+            tool_timeout = 0,        // на mock не виникає (exec миттєвий)
+            guardrail_refusal = 0,   // refusal дає провайдер, не власний детект
+        },
     });
 });
 app.MapGet("/cost", async () =>
