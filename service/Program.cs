@@ -218,9 +218,13 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // персональний стан / результат інструмента не кешуємо (межа — п.4).
     if (status is >= 200 and < 300 && toolCall is null)
     {
-        cache[cacheKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
+        // ключ рахуємо з моделі, що РЕАЛЬНО відповіла (model уже = chain[i] після fallback),
+        // а не з початкового вибору роутера — інакше відповідь резервної моделі
+        // осіла б під ключем основної і віддавалась би як її, коли основна оживе.
+        var writeKey = CacheKey(model, systemPrompt, userMessage);
+        cache[writeKey] = new CacheEntry(answer, DateTimeOffset.UtcNow);
         if (redisDb != null && queryVector != null)
-        await SaveToSemanticCache(redisDb, model, queryVector, answer);
+            await SaveToSemanticCache(redisDb, model, queryVector, answer);
     }
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
