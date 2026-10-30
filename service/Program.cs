@@ -55,6 +55,8 @@ var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
 var fallbacks = 0;
+var providerFails = new ConcurrentDictionary<string, int>();
+const int degradeAfter = 3;
 
 var budgetUsd = 5.00m;
 
@@ -169,10 +171,13 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             promptTokens = res.pt;
             completionTokens = res.ct;
             status = res.status;
+            providerFails[chain[i]] = 0;                         // успіх → лічильник збоїв нуль
+
         }
         else
         {
             status = res.status;
+            providerFails.AddOrUpdate(chain[i], 1, (_, n) => n + 1);  // збій → +1 поспіль
         }
     }
 
@@ -235,7 +240,41 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));
+app.MapGet("/observability", async () =>
+{
+    int requests = 0, p95 = 0;
+    double errorRate = 0;
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*), "
+            + "COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0), "
+            + "COALESCE(AVG(CASE WHEN status <> '200' THEN 1.0 ELSE 0 END) * 100, 0) "
+            + "FROM requests WHERE created_at::date = CURRENT_DATE", db);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        if (await reader.ReadAsync())
+        {
+            requests = reader.GetInt32(0);
+            p95 = (int)reader.GetDouble(1);
+            errorRate = reader.GetDouble(2);
+        }
+    }
+    catch { /* БД недоступна — віддаємо нулі, не валимо ендпоінт */ }
+
+    var totalCacheLookups = cacheHits + cacheMisses;
+    var cacheHitPct = totalCacheLookups == 0 ? 0 : Math.Round(cacheHits * 100.0 / totalCacheLookups, 1);
+
+    return Results.Json(new
+    {
+        p95_ms = p95,
+        requests,
+        cache_hit_pct = cacheHitPct,
+        error_rate_pct = Math.Round(errorRate, 1),
+        fallback_events = fallbacks,
+    });
+});
 app.MapGet("/cost", async () =>
 {
     var todayUsd = await GetTodayCost(dbConn);
@@ -261,7 +300,20 @@ app.MapGet("/prompts", async () =>
     return Results.Json(result);
 });
 
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));
+app.MapGet("/providers", () =>
+{
+    var models = defaultModel == "mock"
+        ? new[] { "mock-mini", "mock-strong", "mock" }
+        : new[] { defaultModel, "azure-gpt-5" };
+
+    var providers = models.Select(m => new
+    {
+        name = m,
+        status = providerFails.GetValueOrDefault(m, 0) >= degradeAfter ? "degraded" : "ok"
+    });
+
+    return Results.Json(new { providers });
+});
 // [W4] HITL: оператор бачить заявки, що очікують рішення (result == null).
 // Форма { pending: [{ id, action }] } — саме її читає картка Approvals у консолі.
 app.MapGet("/approvals", () =>
