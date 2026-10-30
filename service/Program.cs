@@ -339,7 +339,15 @@ app.MapGet("/approvals", () =>
         .Where(kv => kv.Value.Result == null)
         .Select(kv => new { id = kv.Key, action = kv.Value.Action })
         .ToList();
-    return Results.Json(new { pending });
+
+    // виконані заявки з результатом — щоб інваріант «один approve = один тікет»
+    // можна було перевірити будь-коли, а не лише у відповіді на сам approve
+    var done = approvals
+        .Where(kv => kv.Value.Result != null)
+        .Select(kv => new { id = kv.Key, action = kv.Value.Action, result = kv.Value.Result })
+        .ToList();
+
+    return Results.Json(new { pending, done });
 });
 
 app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest request) =>
