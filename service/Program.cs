@@ -55,7 +55,11 @@ var cacheTtl = TimeSpan.FromMinutes(10);
 var cacheHits = 0;
 var cacheMisses = 0;
 var fallbacks = 0;
-var providerFails = new ConcurrentDictionary<string, int>();
+// час кожного збою per-model (а не лічильник за весь час): degraded рахуємо
+// лише за свіжими збоями у вікні — інакше резервна модель, яку після інциденту
+// ніхто не викликав, назавжди лишалась би degraded, хоча вона справна.
+var providerFails = new ConcurrentDictionary<string, List<DateTimeOffset>>();
+var failWindow = TimeSpan.FromMinutes(2);
 // таксономія помилок (W5 опційно): окремі лічильники за причиною збою.
 // На mock реально зростають provider_429/provider_503/db_error;
 // tool_timeout і guardrail_refusal на mock не виникають (exec миттєвий,
@@ -63,6 +67,7 @@ var providerFails = new ConcurrentDictionary<string, int>();
 var errProvider429 = 0;
 var errProvider503 = 0;
 var errDbError = 0;
+var errProviderError = 0;
 const int degradeAfter = 3;
 
 var budgetUsd = 5.00m;
@@ -179,14 +184,18 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             promptTokens = res.pt;
             completionTokens = res.ct;
             status = res.status;
-            providerFails[chain[i]] = 0;                         // успіх → лічильник збоїв нуль
+            providerFails[chain[i]] = new List<DateTimeOffset>();  // успіх → чистимо історію збоїв
         }
         else
         {
             status = res.status;
-            providerFails.AddOrUpdate(chain[i], 1, (_, n) => n + 1);  // збій → +1 поспіль
+            // записуємо ЧАС збою; старі самі «вивітряться» з вікна в /providers
+            providerFails.AddOrUpdate(chain[i],
+                _ => new List<DateTimeOffset> { DateTimeOffset.UtcNow },
+                (_, list) => { lock (list) { list.Add(DateTimeOffset.UtcNow); } return list; });
             if (res.status == 429) Interlocked.Increment(ref errProvider429);
             else if (res.status == 503 || res.status == 0) Interlocked.Increment(ref errProvider503);
+            else Interlocked.Increment(ref errProviderError);
         }
      }       
 
@@ -251,8 +260,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 app.MapGet("/observability", async () =>
 {
-    int requests = 0, p95 = 0;
+        int requests = 0, p95 = 0;
     double errorRate = 0;
+    bool dbUp = true;
     try
     {
         await using var db = new NpgsqlConnection(dbConn);
@@ -270,7 +280,10 @@ app.MapGet("/observability", async () =>
             errorRate = reader.GetDouble(2);
         }
     }
-    catch { /* БД недоступна — віддаємо нулі, не валимо ендпоінт */ }
+    catch { dbUp = false; /* БД недоступна — сигналізуємо збій, а не нулі */ }
+
+    if (!dbUp)
+        return Results.Json(new { error = "observability data unavailable (db down)" }, statusCode: 503);
 
     var totalCacheLookups = cacheHits + cacheMisses;
     var cacheHitPct = totalCacheLookups == 0 ? 0 : Math.Round(cacheHits * 100.0 / totalCacheLookups, 1);
@@ -289,6 +302,7 @@ app.MapGet("/observability", async () =>
             db_error = errDbError,
             tool_timeout = 0,        // на mock не виникає (exec миттєвий)
             guardrail_refusal = 0,   // refusal дає провайдер, не власний детект
+            provider_error = errProviderError,   // інші 5xx/4xx від gateway (напр. 500 — провайдер недосяжний через gateway)
         },
     });
 });
@@ -317,6 +331,14 @@ app.MapGet("/prompts", async () =>
     return Results.Json(result);
 });
 
+// скільки збоїв у моделі за останні failWindow — лише вони вирішують degraded
+int RecentFails(string m)
+{
+    if (!providerFails.TryGetValue(m, out var list)) return 0;
+    var cutoff = DateTimeOffset.UtcNow - failWindow;
+    lock (list) { return list.Count(ts => ts >= cutoff); }
+}
+
 app.MapGet("/providers", () =>
 {
     var models = defaultModel == "mock"
@@ -326,7 +348,7 @@ app.MapGet("/providers", () =>
     var providers = models.Select(m => new
     {
         name = m,
-        status = providerFails.GetValueOrDefault(m, 0) >= degradeAfter ? "degraded" : "ok"
+        status = RecentFails(m) >= degradeAfter ? "degraded" : "ok"
     });
 
     return Results.Json(new { providers });
