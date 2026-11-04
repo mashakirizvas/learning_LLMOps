@@ -46,7 +46,7 @@ jobs:
       - name: Evals
         env:
           SERVICE_URL: http://localhost:8080
-        run: python evals/run.py --dataset evals/golden.jsonl --threshold 5
+        run: python evals/run.py --dataset evals/golden.jsonl --threshold 9
 
       - name: Logs on failure
         if: failure()
